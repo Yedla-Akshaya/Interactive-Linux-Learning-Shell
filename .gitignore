@@ -1,0 +1,8 @@
+student_data.json
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+*.swo
+*.save
+*.bak
