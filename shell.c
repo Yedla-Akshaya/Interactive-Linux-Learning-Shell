@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <errno.h>
+#include <limits.h>
 
 #define INPUT_SIZE 1024
 #define HISTORY_SIZE 100
@@ -78,7 +79,7 @@ static void show_info(void)
 {
     printf("MyShell - Interactive Linux Learning Shell\n");
     printf("A beginner-friendly shell written in C.\n");
-    printf("Week 6: Command validation and history improvements.\n");
+    printf("Week 7: Persistent command history.\n");
 }
 
 /* Display the current working directory. */
@@ -149,11 +150,102 @@ static void set_environment_variable(const char *assignment)
     free(name);
 }
 
-/* Display command history. */
+/* Display the commands currently in memory. */
 static void show_history(char history[][INPUT_SIZE], int history_count)
 {
     for (int i = 0; i < history_count; i++) {
         printf("%d  %s\n", i + 1, history[i]);
+    }
+}
+
+/* Construct the history file path inside the user's home directory. */
+static int get_history_path(char path[], size_t path_size)
+{
+    const char *home = getenv("HOME");
+
+    if (home == NULL || home[0] == '\0') {
+        fprintf(stderr, "MyShell: HOME is not set; history is disabled.\n");
+        return -1;
+    }
+
+    int written = snprintf(path, path_size, "%s/.myshell_history", home);
+
+    if (written < 0 || (size_t)written >= path_size) {
+        fprintf(stderr, "MyShell: history file path is too long.\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+/* Load previous commands, retaining at most the latest 100. */
+static void load_history(char history[][INPUT_SIZE], int *history_count,
+                         const char *history_path)
+{
+    FILE *file = fopen(history_path, "r");
+
+    if (file == NULL) {
+        if (errno != ENOENT) {
+            perror("MyShell: cannot read history");
+        }
+        return;
+    }
+
+    char line[INPUT_SIZE];
+
+    while (fgets(line, sizeof(line), file) != NULL) {
+        size_t length = strlen(line);
+
+        if (length > 0 && line[length - 1] != '\n' && !feof(file)) {
+            int ch;
+
+            while ((ch = fgetc(file)) != '\n' && ch != EOF) {
+                /* Discard an overlong history entry. */
+            }
+
+            fprintf(stderr, "MyShell: skipped an oversized history entry.\n");
+            continue;
+        }
+
+        line[strcspn(line, "\n")] = '\0';
+
+        if (line[0] == '\0') {
+            continue;
+        }
+
+        if (*history_count == HISTORY_SIZE) {
+            memmove(history[0], history[1],
+                    (HISTORY_SIZE - 1) * INPUT_SIZE);
+            (*history_count)--;
+        }
+
+        snprintf(history[*history_count], INPUT_SIZE, "%s", line);
+        (*history_count)++;
+    }
+
+    if (ferror(file)) {
+        perror("MyShell: reading history");
+    }
+
+    fclose(file);
+}
+
+/* Append one command to the history file. */
+static void save_history_entry(const char *history_path, const char *command)
+{
+    FILE *file = fopen(history_path, "a");
+
+    if (file == NULL) {
+        perror("MyShell: cannot save history");
+        return;
+    }
+
+    if (fprintf(file, "%s\n", command) < 0) {
+        perror("MyShell: writing history");
+    }
+
+    if (fclose(file) == EOF) {
+        perror("MyShell: closing history");
     }
 }
 
@@ -196,7 +288,6 @@ static void execute_pipeline(char *input, char *pipe_position)
     char *left_args[MAX_ARGS];
     char *right_args[MAX_ARGS];
 
-    /* Reject additional pipes. */
     if (strchr(pipe_position + 1, '|') != NULL) {
         fprintf(stderr,
                 "Syntax error: only one pipe is supported.\n");
@@ -308,36 +399,30 @@ static void execute_command(char *input)
         return;
     }
 
-    /* Exit MyShell. */
     if (strcmp(args[0], "exit") == 0) {
         exit(0);
     }
 
-    /* Greeting. */
     if (strcmp(args[0], "hello") == 0) {
         printf("Hello! Welcome to MyShell.\n");
         return;
     }
 
-    /* Shell information. */
     if (strcmp(args[0], "info") == 0) {
         show_info();
         return;
     }
 
-    /* Current directory. */
     if (strcmp(args[0], "pwd") == 0) {
         show_pwd();
         return;
     }
 
-    /* Environment variables. */
     if (strcmp(args[0], "env") == 0) {
         show_environment();
         return;
     }
 
-    /* Set environment variable. */
     if (strcmp(args[0], "export") == 0) {
         if (args[1] == NULL || args[2] != NULL) {
             fprintf(stderr, "export: use export NAME=value\n");
@@ -347,7 +432,6 @@ static void execute_command(char *input)
         return;
     }
 
-    /* Help information. */
     if (strcmp(args[0], "help") == 0) {
         printf("Available built-ins:\n");
         printf("  hello   - Display a greeting\n");
@@ -363,7 +447,6 @@ static void execute_command(char *input)
         return;
     }
 
-    /* Change directory. */
     if (strcmp(args[0], "cd") == 0) {
         if (args[2] != NULL) {
             fprintf(stderr, "cd: too many arguments\n");
@@ -418,7 +501,6 @@ static void execute_command(char *input)
         return;
     }
 
-    /* Launch an external program. */
     pid_t pid = fork();
 
     if (pid == -1) {
@@ -465,6 +547,14 @@ int main(void)
     char input[INPUT_SIZE];
     char history[HISTORY_SIZE][INPUT_SIZE];
     int history_count = 0;
+    char history_path[PATH_SIZE];
+
+    int history_enabled =
+        get_history_path(history_path, sizeof(history_path)) == 0;
+
+    if (history_enabled) {
+        load_history(history, &history_count, history_path);
+    }
 
     while (1) {
         printf("MyShell> ");
@@ -476,7 +566,6 @@ int main(void)
 
         size_t input_len = strlen(input);
 
-        /* Reject oversized command lines. */
         if (input_len > 0 &&
             input[input_len - 1] != '\n' &&
             !feof(stdin)) {
@@ -493,23 +582,43 @@ int main(void)
         }
 
         input[strcspn(input, "\n")] = '\0';
-
-        /* Ignore empty or whitespace-only commands. */
         trim_whitespace(input);
 
         if (input[0] == '\0') {
             continue;
         }
 
-        /* Save the command before parsing changes the input buffer. */
-        if (history_count < HISTORY_SIZE) {
-            strcpy(history[history_count], input);
-            history_count++;
-        }
-
+        /* Show history before adding the current history command. */
         if (strcmp(input, "history") == 0) {
             show_history(history, history_count);
+            if (history_enabled) {
+                save_history_entry(history_path, input);
+            }
+
+            if (history_count < HISTORY_SIZE) {
+                snprintf(history[history_count], INPUT_SIZE, "%s", input);
+                history_count++;
+            } else {
+                memmove(history[0], history[1],
+                        (HISTORY_SIZE - 1) * INPUT_SIZE);
+                snprintf(history[HISTORY_SIZE - 1], INPUT_SIZE, "%s", input);
+            }
+
             continue;
+        }
+
+        /* Keep the in-memory history limited to the newest 100 commands. */
+        if (history_count < HISTORY_SIZE) {
+            snprintf(history[history_count], INPUT_SIZE, "%s", input);
+            history_count++;
+        } else {
+            memmove(history[0], history[1],
+                    (HISTORY_SIZE - 1) * INPUT_SIZE);
+            snprintf(history[HISTORY_SIZE - 1], INPUT_SIZE, "%s", input);
+        }
+
+        if (history_enabled) {
+            save_history_entry(history_path, input);
         }
 
         execute_command(input);
