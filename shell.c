@@ -78,7 +78,7 @@ static void show_info(void)
 {
     printf("MyShell - Interactive Linux Learning Shell\n");
     printf("A beginner-friendly shell written in C.\n");
-    printf("Week 5: Built-ins and environment variables.\n");
+    printf("Week 6: Command validation and history improvements.\n");
 }
 
 /* Display the current working directory. */
@@ -190,11 +190,18 @@ static void report_child_status(const char *command, int status)
     }
 }
 
-/* Execute a pipeline containing one pipe. */
+/* Execute a pipeline containing exactly one pipe. */
 static void execute_pipeline(char *input, char *pipe_position)
 {
     char *left_args[MAX_ARGS];
     char *right_args[MAX_ARGS];
+
+    /* Reject additional pipes. */
+    if (strchr(pipe_position + 1, '|') != NULL) {
+        fprintf(stderr,
+                "Syntax error: only one pipe is supported.\n");
+        return;
+    }
 
     *pipe_position = '\0';
 
@@ -202,8 +209,14 @@ static void execute_pipeline(char *input, char *pipe_position)
     int right_count = parse_arguments(
         pipe_position + 1, right_args, MAX_ARGS);
 
-    if (left_count <= 0 || right_count <= 0) {
+    if (left_count < 0 || right_count < 0) {
         fprintf(stderr, "Syntax error: invalid pipeline.\n");
+        return;
+    }
+
+    if (left_count == 0 || right_count == 0) {
+        fprintf(stderr,
+                "Syntax error: both sides of the pipe need a command.\n");
         return;
     }
 
@@ -426,6 +439,27 @@ static void execute_command(char *input)
     }
 }
 
+/* Trim leading and trailing spaces or tabs in place. */
+static void trim_whitespace(char *text)
+{
+    char *start = text;
+
+    while (*start == ' ' || *start == '\t') {
+        start++;
+    }
+
+    if (start != text) {
+        memmove(text, start, strlen(start) + 1);
+    }
+
+    size_t length = strlen(text);
+
+    while (length > 0 &&
+           (text[length - 1] == ' ' || text[length - 1] == '\t')) {
+        text[--length] = '\0';
+    }
+}
+
 int main(void)
 {
     char input[INPUT_SIZE];
@@ -459,6 +493,9 @@ int main(void)
         }
 
         input[strcspn(input, "\n")] = '\0';
+
+        /* Ignore empty or whitespace-only commands. */
+        trim_whitespace(input);
 
         if (input[0] == '\0') {
             continue;
