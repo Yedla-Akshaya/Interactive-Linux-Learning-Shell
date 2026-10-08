@@ -6,10 +6,10 @@
 
 int main() {
 
-    char input[100];
+    char input[1024];
 
     // Store previous commands
-    char history[100][100];
+    char history[100][1024];
     int history_count = 0;
 
     while (1) {
@@ -21,6 +21,24 @@ int main() {
         // Read user input
         if (fgets(input, sizeof(input), stdin) == NULL) {
             break;
+        }
+
+        // Reject commands that do not fit in the input buffer.
+        size_t input_len = strlen(input);
+
+        if (input_len > 0 &&
+            input[input_len - 1] != '\n' &&
+            !feof(stdin)) {
+
+            int ch;
+            while ((ch = getchar()) != '\n' && ch != EOF) {
+                // Discard the rest of the oversized command.
+            }
+
+            fprintf(stderr,
+                    "Input too long (maximum %zu characters). Command ignored.\n",
+                    sizeof(input) - 1);
+            continue;
         }
 
         // Remove newline
