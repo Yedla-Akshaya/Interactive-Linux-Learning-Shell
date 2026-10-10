@@ -1,628 +1,741 @@
-
 #define _POSIX_C_SOURCE 200809L
 
+#include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+#include <sys/types.h>
 #include <sys/wait.h>
-#include <errno.h>
-#include <limits.h>
+#include <unistd.h>
 
 #define INPUT_SIZE 1024
+#define MAX_ARGS 100
 #define HISTORY_SIZE 100
-#define MAX_ARGS 64
-#define PATH_SIZE 4096
+#define EXPANDED_SIZE 4096
 
-extern char **environ;
+static char history[HISTORY_SIZE][INPUT_SIZE];
+static int history_count = 0;
+static char history_path[INPUT_SIZE];
 
-/* Parse arguments while preserving spaces inside quotes. */
-static int parse_arguments(char *input, char *args[], int max_args)
+/* ---------- Persistent command history ---------- */
+
+static void add_history(const char *command)
 {
-    char *src = input;
-    char *dst = input;
-    int argc = 0;
+    if (command == NULL || *command == '\0')
+        return;
 
-    while (*src != '\0') {
-        while (*src == ' ' || *src == '\t') {
-            src++;
+    if (history_count == HISTORY_SIZE) {
+        memmove(history, history + 1,
+                sizeof(history[0]) * (HISTORY_SIZE - 1));
+        history_count--;
+    }
+
+    snprintf(history[history_count], INPUT_SIZE, "%s", command);
+    history_count++;
+}
+
+static void save_history_entry(const char *command)
+{
+    FILE *file = fopen(history_path, "a");
+
+    if (file == NULL) {
+        perror("myshell: history");
+        return;
+    }
+
+    fprintf(file, "%s\n", command);
+    fclose(file);
+}
+
+static void load_history(void)
+{
+    const char *home = getenv("HOME");
+
+    if (home == NULL || snprintf(history_path, sizeof(history_path),
+                                "%s/.myshell_history", home)
+                        >= (int)sizeof(history_path)) {
+        snprintf(history_path, sizeof(history_path),
+                 ".myshell_history");
+    }
+
+    FILE *file = fopen(history_path, "r");
+
+    if (file == NULL)
+        return;
+
+    char line[INPUT_SIZE];
+
+    while (fgets(line, sizeof(line), file) != NULL) {
+        line[strcspn(line, "\n")] = '\0';
+
+        if (*line != '\0')
+            add_history(line);
+    }
+
+    fclose(file);
+}
+
+static void show_history(void)
+{
+    for (int i = 0; i < history_count; i++)
+        printf("%4d  %s\n", i + 1, history[i]);
+}
+
+/* ---------- History search ---------- */
+
+static int contains_ignore_case(const char *text,
+                                const char *keyword)
+{
+    if (text == NULL || keyword == NULL)
+        return 0;
+
+    if (*keyword == '\0')
+        return 1;
+
+    for (; *text != '\0'; text++) {
+        const char *a = text;
+        const char *b = keyword;
+
+        while (*a != '\0' && *b != '\0' &&
+               tolower((unsigned char)*a) ==
+               tolower((unsigned char)*b)) {
+            a++;
+            b++;
         }
 
-        if (*src == '\0' || *src == '\n') {
+        if (*b == '\0')
+            return 1;
+    }
+
+    return 0;
+}
+
+static void find_history(const char *keyword)
+{
+    if (keyword == NULL || *keyword == '\0') {
+        fprintf(stderr, "Usage: findhistory KEYWORD\n");
+        return;
+    }
+
+    int matches = 0;
+
+    /*
+     * The latest entry is the findhistory command currently
+     * being executed. Exclude it so a search cannot match itself.
+     */
+    int search_count = history_count;
+
+    if (search_count > 0)
+        search_count--;
+
+    for (int i = 0; i < search_count; i++) {
+        if (contains_ignore_case(history[i], keyword)) {
+            printf("%4d  %s\n", i + 1, history[i]);
+            matches++;
+        }
+    }
+
+    if (matches == 0)
+        printf("No history entries found containing \"%s\".\n",
+               keyword);
+}
+
+/* ---------- Information command ---------- */
+
+static void show_info(void)
+{
+    printf("\n");
+    printf("====================================\n");
+    printf("       MyShell - Week 8\n");
+    printf("====================================\n");
+    printf("Interactive Linux Learning Shell\n");
+    printf("Features:\n");
+    printf("  - External command execution\n");
+    printf("  - Built-in commands\n");
+    printf("  - Environment variables\n");
+    printf("  - Single pipeline support\n");
+    printf("  - Persistent command history\n");
+    printf("  - Command history search\n");
+    printf("Built-ins: cd, pwd, history, findhistory,\n");
+    printf("           export, info, exit\n");
+    printf("====================================\n\n");
+}
+
+/* ---------- Environment variable expansion ---------- */
+
+static int expand_variables(const char *input,
+                            char *output,
+                            size_t output_size)
+{
+    size_t used = 0;
+
+    if (output_size == 0)
+        return -1;
+
+    for (size_t i = 0; input[i] != '\0';) {
+        if (input[i] == '$') {
+            size_t start;
+            size_t length;
+            char variable[INPUT_SIZE];
+            const char *value = "";
+
+            if (input[i + 1] == '{') {
+                start = i + 2;
+                size_t end = start;
+
+                while (input[end] != '\0' && input[end] != '}')
+                    end++;
+
+                if (input[end] != '}') {
+                    fprintf(stderr,
+                            "myshell: unmatched ${ in variable\n");
+                    return -1;
+                }
+
+                length = end - start;
+                i = end + 1;
+            } else {
+                start = i + 1;
+
+                if (!(isalpha((unsigned char)input[start]) ||
+                      input[start] == '_')) {
+                    if (used + 1 >= output_size)
+                        return -1;
+
+                    output[used++] = input[i++];
+                    continue;
+                }
+
+                size_t end = start;
+
+                while (isalnum((unsigned char)input[end]) ||
+                       input[end] == '_')
+                    end++;
+
+                length = end - start;
+                i = end;
+            }
+
+            if (length >= sizeof(variable)) {
+                fprintf(stderr,
+                        "myshell: variable name too long\n");
+                return -1;
+            }
+
+            memcpy(variable, input + start, length);
+            variable[length] = '\0';
+
+            const char *environment_value = getenv(variable);
+
+            if (environment_value != NULL)
+                value = environment_value;
+
+            size_t value_length = strlen(value);
+
+            if (value_length >= output_size - used) {
+                fprintf(stderr,
+                        "myshell: expanded command is too long\n");
+                return -1;
+            }
+
+            memcpy(output + used, value, value_length);
+            used += value_length;
+        } else {
+            if (used + 1 >= output_size) {
+                fprintf(stderr,
+                        "myshell: expanded command is too long\n");
+                return -1;
+            }
+
+            output[used++] = input[i++];
+        }
+    }
+
+    output[used] = '\0';
+    return 0;
+}
+
+/* ---------- Command parser ---------- */
+
+/*
+ * Split a command into arguments.
+ * Supports single quotes, double quotes and backslash escaping.
+ * Returns -1 for unmatched quotes or too many arguments.
+ */
+static int parse_command(char *command,
+                         char *args[],
+                         char *storage,
+                         size_t storage_size)
+{
+    size_t input_length = strlen(command);
+    size_t out = 0;
+    int argc = 0;
+    char quote = '\0';
+    int token_started = 0;
+    size_t token_start = 0;
+
+    for (size_t i = 0; i <= input_length; i++) {
+        char c = command[i];
+
+        if (c == '\0') {
+            if (quote != '\0') {
+                fprintf(stderr, "myshell: unmatched quote\n");
+                return -1;
+            }
+
+            if (token_started) {
+                if (argc >= MAX_ARGS - 1 ||
+                    out >= storage_size) {
+                    fprintf(stderr,
+                            "myshell: too many arguments\n");
+                    return -1;
+                }
+
+                storage[out++] = '\0';
+                args[argc++] = &storage[token_start];
+            }
+
             break;
         }
 
-        if (argc >= max_args - 1) {
-            fprintf(stderr, "Too many arguments (maximum %d).\n",
-                    max_args - 1);
-            return -1;
-        }
-
-        args[argc++] = dst;
-        char quote = '\0';
-
-        while (*src != '\0' && *src != '\n') {
-            if (quote != '\0') {
-                if (*src == quote) {
-                    quote = '\0';
-                    src++;
-                } else {
-                    *dst++ = *src++;
-                }
-            } else if (*src == '\'' || *src == '"') {
-                quote = *src++;
-            } else if (*src == ' ' || *src == '\t') {
-                break;
-            } else {
-                *dst++ = *src++;
-            }
-        }
-
         if (quote != '\0') {
-            fprintf(stderr, "Syntax error: unmatched quote.\n");
+            if (c == quote) {
+                quote = '\0';
+            } else if (c == '\\' && quote == '"' &&
+                       command[i + 1] != '\0') {
+                if (out + 1 >= storage_size)
+                    return -1;
+
+                storage[out++] = command[++i];
+            } else {
+                if (out + 1 >= storage_size)
+                    return -1;
+
+                storage[out++] = c;
+            }
+
+            token_started = 1;
+            continue;
+        }
+
+        if (c == '\'' || c == '"') {
+            if (!token_started)
+                token_start = out;
+
+            quote = c;
+            token_started = 1;
+            continue;
+        }
+
+        if (c == '\\' && command[i + 1] != '\0') {
+            if (!token_started)
+                token_start = out;
+
+            if (out + 1 >= storage_size)
+                return -1;
+
+            storage[out++] = command[++i];
+            token_started = 1;
+            continue;
+        }
+
+        if (isspace((unsigned char)c)) {
+            if (token_started) {
+                if (argc >= MAX_ARGS - 1 ||
+                    out >= storage_size) {
+                    fprintf(stderr,
+                            "myshell: too many arguments\n");
+                    return -1;
+                }
+
+                storage[out++] = '\0';
+                args[argc++] = &storage[token_start];
+                token_started = 0;
+            }
+
+            continue;
+        }
+
+        if (!token_started)
+            token_start = out;
+
+        if (out + 1 >= storage_size) {
+            fprintf(stderr, "myshell: command is too long\n");
             return -1;
         }
 
-        while (*src == ' ' || *src == '\t') {
-            src++;
-        }
-
-        *dst++ = '\0';
+        storage[out++] = c;
+        token_started = 1;
     }
 
     args[argc] = NULL;
     return argc;
 }
 
-/* Display information about MyShell. */
-static void show_info(void)
+/* ---------- External command execution ---------- */
+
+static int execute_external(char *args[])
 {
-    printf("MyShell - Interactive Linux Learning Shell\n");
-    printf("A beginner-friendly shell written in C.\n");
-    printf("Week 7: Persistent command history.\n");
-}
-
-/* Display the current working directory. */
-static void show_pwd(void)
-{
-    char cwd[PATH_SIZE];
-
-    if (getcwd(cwd, sizeof(cwd)) == NULL) {
-        perror("pwd");
-        return;
-    }
-
-    printf("%s\n", cwd);
-}
-
-/* Display all environment variables. */
-static void show_environment(void)
-{
-    for (char **entry = environ; *entry != NULL; entry++) {
-        printf("%s\n", *entry);
-    }
-}
-
-/* Set an environment variable using NAME=value. */
-static void set_environment_variable(const char *assignment)
-{
-    const char *equals = strchr(assignment, '=');
-
-    if (equals == NULL || equals == assignment) {
-        fprintf(stderr, "export: use export NAME=value\n");
-        return;
-    }
-
-    size_t name_length = (size_t)(equals - assignment);
-    char *name = malloc(name_length + 1);
-
-    if (name == NULL) {
-        perror("export");
-        return;
-    }
-
-    memcpy(name, assignment, name_length);
-    name[name_length] = '\0';
-
-    if (!(name[0] == '_' ||
-          (name[0] >= 'A' && name[0] <= 'Z') ||
-          (name[0] >= 'a' && name[0] <= 'z'))) {
-        fprintf(stderr, "export: invalid variable name\n");
-        free(name);
-        return;
-    }
-
-    for (size_t i = 1; name[i] != '\0'; i++) {
-        if (!(name[i] == '_' ||
-              (name[i] >= 'A' && name[i] <= 'Z') ||
-              (name[i] >= 'a' && name[i] <= 'z') ||
-              (name[i] >= '0' && name[i] <= '9'))) {
-            fprintf(stderr, "export: invalid variable name\n");
-            free(name);
-            return;
-        }
-    }
-
-    if (setenv(name, equals + 1, 1) == -1) {
-        perror("export");
-    }
-
-    free(name);
-}
-
-/* Display the commands currently in memory. */
-static void show_history(char history[][INPUT_SIZE], int history_count)
-{
-    for (int i = 0; i < history_count; i++) {
-        printf("%d  %s\n", i + 1, history[i]);
-    }
-}
-
-/* Construct the history file path inside the user's home directory. */
-static int get_history_path(char path[], size_t path_size)
-{
-    const char *home = getenv("HOME");
-
-    if (home == NULL || home[0] == '\0') {
-        fprintf(stderr, "MyShell: HOME is not set; history is disabled.\n");
-        return -1;
-    }
-
-    int written = snprintf(path, path_size, "%s/.myshell_history", home);
-
-    if (written < 0 || (size_t)written >= path_size) {
-        fprintf(stderr, "MyShell: history file path is too long.\n");
-        return -1;
-    }
-
-    return 0;
-}
-
-/* Load previous commands, retaining at most the latest 100. */
-static void load_history(char history[][INPUT_SIZE], int *history_count,
-                         const char *history_path)
-{
-    FILE *file = fopen(history_path, "r");
-
-    if (file == NULL) {
-        if (errno != ENOENT) {
-            perror("MyShell: cannot read history");
-        }
-        return;
-    }
-
-    char line[INPUT_SIZE];
-
-    while (fgets(line, sizeof(line), file) != NULL) {
-        size_t length = strlen(line);
-
-        if (length > 0 && line[length - 1] != '\n' && !feof(file)) {
-            int ch;
-
-            while ((ch = fgetc(file)) != '\n' && ch != EOF) {
-                /* Discard an overlong history entry. */
-            }
-
-            fprintf(stderr, "MyShell: skipped an oversized history entry.\n");
-            continue;
-        }
-
-        line[strcspn(line, "\n")] = '\0';
-
-        if (line[0] == '\0') {
-            continue;
-        }
-
-        if (*history_count == HISTORY_SIZE) {
-            memmove(history[0], history[1],
-                    (HISTORY_SIZE - 1) * INPUT_SIZE);
-            (*history_count)--;
-        }
-
-        snprintf(history[*history_count], INPUT_SIZE, "%s", line);
-        (*history_count)++;
-    }
-
-    if (ferror(file)) {
-        perror("MyShell: reading history");
-    }
-
-    fclose(file);
-}
-
-/* Append one command to the history file. */
-static void save_history_entry(const char *history_path, const char *command)
-{
-    FILE *file = fopen(history_path, "a");
-
-    if (file == NULL) {
-        perror("MyShell: cannot save history");
-        return;
-    }
-
-    if (fprintf(file, "%s\n", command) < 0) {
-        perror("MyShell: writing history");
-    }
-
-    if (fclose(file) == EOF) {
-        perror("MyShell: closing history");
-    }
-}
-
-/* Wait for a child, retrying when interrupted by a signal. */
-static int wait_for_child(pid_t pid, int *status)
-{
-    pid_t result;
-
-    do {
-        result = waitpid(pid, status, 0);
-    } while (result == -1 && errno == EINTR);
-
-    if (result == -1) {
-        perror("waitpid");
-        return -1;
-    }
-
-    return 0;
-}
-
-/* Report a child's exit status or terminating signal. */
-static void report_child_status(const char *command, int status)
-{
-    if (WIFEXITED(status)) {
-        int code = WEXITSTATUS(status);
-
-        if (code != 0) {
-            fprintf(stderr, "%s: exited with status %d\n",
-                    command, code);
-        }
-    } else if (WIFSIGNALED(status)) {
-        fprintf(stderr, "%s: terminated by signal %d\n",
-                command, WTERMSIG(status));
-    }
-}
-
-/* Execute a pipeline containing exactly one pipe. */
-static void execute_pipeline(char *input, char *pipe_position)
-{
-    char *left_args[MAX_ARGS];
-    char *right_args[MAX_ARGS];
-
-    if (strchr(pipe_position + 1, '|') != NULL) {
-        fprintf(stderr,
-                "Syntax error: only one pipe is supported.\n");
-        return;
-    }
-
-    *pipe_position = '\0';
-
-    int left_count = parse_arguments(input, left_args, MAX_ARGS);
-    int right_count = parse_arguments(
-        pipe_position + 1, right_args, MAX_ARGS);
-
-    if (left_count < 0 || right_count < 0) {
-        fprintf(stderr, "Syntax error: invalid pipeline.\n");
-        return;
-    }
-
-    if (left_count == 0 || right_count == 0) {
-        fprintf(stderr,
-                "Syntax error: both sides of the pipe need a command.\n");
-        return;
-    }
-
-    int pipe_fd[2];
-
-    if (pipe(pipe_fd) == -1) {
-        perror("pipe");
-        return;
-    }
-
-    pid_t left_pid = fork();
-
-    if (left_pid == -1) {
-        perror("fork");
-        close(pipe_fd[0]);
-        close(pipe_fd[1]);
-        return;
-    }
-
-    if (left_pid == 0) {
-        close(pipe_fd[0]);
-
-        if (dup2(pipe_fd[1], STDOUT_FILENO) == -1) {
-            perror("dup2");
-            _exit(126);
-        }
-
-        close(pipe_fd[1]);
-        execvp(left_args[0], left_args);
-        perror(left_args[0]);
-        _exit(127);
-    }
-
-    pid_t right_pid = fork();
-
-    if (right_pid == -1) {
-        perror("fork");
-        close(pipe_fd[0]);
-        close(pipe_fd[1]);
-
-        int ignored_status;
-        wait_for_child(left_pid, &ignored_status);
-        return;
-    }
-
-    if (right_pid == 0) {
-        close(pipe_fd[1]);
-
-        if (dup2(pipe_fd[0], STDIN_FILENO) == -1) {
-            perror("dup2");
-            _exit(126);
-        }
-
-        close(pipe_fd[0]);
-        execvp(right_args[0], right_args);
-        perror(right_args[0]);
-        _exit(127);
-    }
-
-    close(pipe_fd[0]);
-    close(pipe_fd[1]);
-
-    int left_status;
-    int right_status;
-
-    if (wait_for_child(left_pid, &left_status) == 0) {
-        report_child_status(left_args[0], left_status);
-    }
-
-    if (wait_for_child(right_pid, &right_status) == 0) {
-        report_child_status(right_args[0], right_status);
-    }
-}
-
-/* Execute built-in commands and external programs. */
-static void execute_command(char *input)
-{
-    char *pipe_position = strchr(input, '|');
-
-    if (pipe_position != NULL) {
-        execute_pipeline(input, pipe_position);
-        return;
-    }
-
-    char *args[MAX_ARGS];
-    int arg_count = parse_arguments(input, args, MAX_ARGS);
-
-    if (arg_count <= 0) {
-        return;
-    }
-
-    if (strcmp(args[0], "exit") == 0) {
-        exit(0);
-    }
-
-    if (strcmp(args[0], "hello") == 0) {
-        printf("Hello! Welcome to MyShell.\n");
-        return;
-    }
-
-    if (strcmp(args[0], "info") == 0) {
-        show_info();
-        return;
-    }
-
-    if (strcmp(args[0], "pwd") == 0) {
-        show_pwd();
-        return;
-    }
-
-    if (strcmp(args[0], "env") == 0) {
-        show_environment();
-        return;
-    }
-
-    if (strcmp(args[0], "export") == 0) {
-        if (args[1] == NULL || args[2] != NULL) {
-            fprintf(stderr, "export: use export NAME=value\n");
-        } else {
-            set_environment_variable(args[1]);
-        }
-        return;
-    }
-
-    if (strcmp(args[0], "help") == 0) {
-        printf("Available built-ins:\n");
-        printf("  hello   - Display a greeting\n");
-        printf("  info    - Display shell information\n");
-        printf("  help    - Display help information\n");
-        printf("  history - Display previous commands\n");
-        printf("  pwd     - Display the current directory\n");
-        printf("  cd      - Change the current directory\n");
-        printf("  env     - Display environment variables\n");
-        printf("  export  - Set an environment variable\n");
-        printf("  exit    - Exit MyShell\n");
-        printf("External commands and one pipeline are supported.\n");
-        return;
-    }
-
-    if (strcmp(args[0], "cd") == 0) {
-        if (args[2] != NULL) {
-            fprintf(stderr, "cd: too many arguments\n");
-            return;
-        }
-
-        char previous_directory[PATH_SIZE];
-        char current_directory[PATH_SIZE];
-
-        if (getcwd(previous_directory, sizeof(previous_directory)) == NULL) {
-            previous_directory[0] = '\0';
-        }
-
-        const char *directory = args[1];
-
-        if (directory == NULL || strcmp(directory, "~") == 0) {
-            directory = getenv("HOME");
-        } else if (strcmp(directory, "-") == 0) {
-            directory = getenv("OLDPWD");
-
-            if (directory == NULL || directory[0] == '\0') {
-                fprintf(stderr, "cd: OLDPWD is not set\n");
-                return;
-            }
-        }
-
-        if (directory == NULL || directory[0] == '\0') {
-            fprintf(stderr, "cd: target directory is not set\n");
-            return;
-        }
-
-        if (chdir(directory) == -1) {
-            perror("cd");
-            return;
-        }
-
-        if (previous_directory[0] != '\0' &&
-            setenv("OLDPWD", previous_directory, 1) == -1) {
-            perror("cd: OLDPWD");
-        }
-
-        if (getcwd(current_directory, sizeof(current_directory)) != NULL) {
-            if (setenv("PWD", current_directory, 1) == -1) {
-                perror("cd: PWD");
-            }
-        }
-
-        if (args[1] != NULL && strcmp(args[1], "-") == 0) {
-            show_pwd();
-        }
-
-        return;
-    }
-
     pid_t pid = fork();
 
-    if (pid == -1) {
-        perror("fork");
-        return;
+    if (pid < 0) {
+        perror("myshell: fork");
+        return -1;
     }
 
     if (pid == 0) {
         execvp(args[0], args);
-        perror(args[0]);
-        _exit(127);
+        fprintf(stderr, "myshell: %s: %s\n",
+                args[0], strerror(errno));
+        _exit(errno == ENOENT ? 127 : 126);
     }
 
     int status;
 
-    if (wait_for_child(pid, &status) == 0) {
-        report_child_status(args[0], status);
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR)
+            continue;
+
+        perror("myshell: waitpid");
+        return -1;
     }
+
+    if (WIFEXITED(status))
+        return WEXITSTATUS(status);
+
+    if (WIFSIGNALED(status))
+        return 128 + WTERMSIG(status);
+
+    return -1;
 }
 
-/* Trim leading and trailing spaces or tabs in place. */
-static void trim_whitespace(char *text)
+/* ---------- Built-in commands ---------- */
+
+static int is_builtin(const char *command)
 {
-    char *start = text;
-
-    while (*start == ' ' || *start == '\t') {
-        start++;
-    }
-
-    if (start != text) {
-        memmove(text, start, strlen(start) + 1);
-    }
-
-    size_t length = strlen(text);
-
-    while (length > 0 &&
-           (text[length - 1] == ' ' || text[length - 1] == '\t')) {
-        text[--length] = '\0';
-    }
+    return strcmp(command, "exit") == 0 ||
+           strcmp(command, "cd") == 0 ||
+           strcmp(command, "pwd") == 0 ||
+           strcmp(command, "history") == 0 ||
+           strcmp(command, "findhistory") == 0 ||
+           strcmp(command, "info") == 0 ||
+           strcmp(command, "export") == 0;
 }
+
+/*
+ * Returns 1 when the shell should exit.
+ * Returns 0 when the shell should continue.
+ */
+static int execute_builtin(char *args[])
+{
+    if (strcmp(args[0], "exit") == 0)
+        return 1;
+
+    if (strcmp(args[0], "cd") == 0) {
+        const char *directory = args[1];
+
+        if (directory == NULL || strcmp(directory, "~") == 0)
+            directory = getenv("HOME");
+
+        if (directory == NULL) {
+            fprintf(stderr, "myshell: HOME is not set\n");
+        } else if (chdir(directory) != 0) {
+            fprintf(stderr, "myshell: cd: %s\n",
+                    strerror(errno));
+        }
+
+        return 0;
+    }
+
+    if (strcmp(args[0], "pwd") == 0) {
+        char directory[PATH_MAX];
+
+        if (getcwd(directory, sizeof(directory)) == NULL)
+            perror("myshell: pwd");
+        else
+            puts(directory);
+
+        return 0;
+    }
+
+    if (strcmp(args[0], "history") == 0) {
+        show_history();
+        return 0;
+    }
+
+    if (strcmp(args[0], "findhistory") == 0) {
+        find_history(args[1]);
+        return 0;
+    }
+
+    if (strcmp(args[0], "info") == 0) {
+        show_info();
+        return 0;
+    }
+
+    if (strcmp(args[0], "export") == 0) {
+        if (args[1] == NULL) {
+            fprintf(stderr, "Usage: export NAME=VALUE\n");
+            return 0;
+        }
+
+        char *equals = strchr(args[1], '=');
+
+        if (equals == NULL || equals == args[1]) {
+            fprintf(stderr, "Usage: export NAME=VALUE\n");
+            return 0;
+        }
+
+        *equals = '\0';
+
+        if (!(isalpha((unsigned char)args[1][0]) ||
+              args[1][0] == '_')) {
+            fprintf(stderr, "myshell: invalid variable name\n");
+            return 0;
+        }
+
+        for (char *p = args[1] + 1; *p != '\0'; p++) {
+            if (!(isalnum((unsigned char)*p) || *p == '_')) {
+                fprintf(stderr, "myshell: invalid variable name\n");
+                return 0;
+            }
+        }
+
+        if (setenv(args[1], equals + 1, 1) != 0)
+            perror("myshell: export");
+
+        return 0;
+    }
+
+    return 0;
+}
+
+/* ---------- Single pipeline support ---------- */
+
+static int execute_pipeline(char *command)
+{
+    char *pipe_position = strchr(command, '|');
+
+    if (pipe_position == NULL)
+        return 0;
+
+    if (strchr(pipe_position + 1, '|') != NULL) {
+        fprintf(stderr,
+                "myshell: only one pipe is supported\n");
+        return 1;
+    }
+
+    *pipe_position = '\0';
+
+    char *left_command = command;
+    char *right_command = pipe_position + 1;
+
+    while (isspace((unsigned char)*left_command))
+        left_command++;
+
+    while (isspace((unsigned char)*right_command))
+        right_command++;
+
+    if (*left_command == '\0' || *right_command == '\0') {
+        fprintf(stderr, "myshell: invalid pipe command\n");
+        return 1;
+    }
+
+    char left_expanded[EXPANDED_SIZE];
+    char right_expanded[EXPANDED_SIZE];
+
+    if (expand_variables(left_command, left_expanded,
+                         sizeof(left_expanded)) != 0 ||
+        expand_variables(right_command, right_expanded,
+                         sizeof(right_expanded)) != 0)
+        return 1;
+
+    char left_storage[INPUT_SIZE];
+    char right_storage[INPUT_SIZE];
+    char *left_args[MAX_ARGS];
+    char *right_args[MAX_ARGS];
+
+    int left_argc = parse_command(left_expanded, left_args,
+                                  left_storage,
+                                  sizeof(left_storage));
+    int right_argc = parse_command(right_expanded, right_args,
+                                   right_storage,
+                                   sizeof(right_storage));
+
+    if (left_argc <= 0 || right_argc <= 0) {
+        fprintf(stderr, "myshell: invalid pipe command\n");
+        return 1;
+    }
+
+    /*
+     * Built-ins are executed in the parent shell, so reject them
+     * in pipelines rather than unexpectedly changing shell state.
+     */
+    if (is_builtin(left_args[0]) || is_builtin(right_args[0])) {
+        fprintf(stderr,
+                "myshell: built-ins are not supported in pipelines\n");
+        return 1;
+    }
+
+    int pipefd[2];
+
+    if (pipe(pipefd) < 0) {
+        perror("myshell: pipe");
+        return 1;
+    }
+
+    pid_t first_pid = fork();
+
+    if (first_pid < 0) {
+        perror("myshell: fork");
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return 1;
+    }
+
+    if (first_pid == 0) {
+        close(pipefd[0]);
+
+        if (dup2(pipefd[1], STDOUT_FILENO) < 0) {
+            perror("myshell: dup2");
+            _exit(1);
+        }
+
+        close(pipefd[1]);
+        execvp(left_args[0], left_args);
+
+        fprintf(stderr, "myshell: %s: %s\n",
+                left_args[0], strerror(errno));
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+
+    pid_t second_pid = fork();
+
+    if (second_pid < 0) {
+        perror("myshell: fork");
+        close(pipefd[0]);
+        close(pipefd[1]);
+        waitpid(first_pid, NULL, 0);
+        return 1;
+    }
+
+    if (second_pid == 0) {
+        close(pipefd[1]);
+
+        if (dup2(pipefd[0], STDIN_FILENO) < 0) {
+            perror("myshell: dup2");
+            _exit(1);
+        }
+
+        close(pipefd[0]);
+        execvp(right_args[0], right_args);
+
+        fprintf(stderr, "myshell: %s: %s\n",
+                right_args[0], strerror(errno));
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+
+    close(pipefd[0]);
+    close(pipefd[1]);
+
+    int status;
+    while (waitpid(first_pid, &status, 0) < 0 && errno == EINTR)
+        ;
+
+    while (waitpid(second_pid, &status, 0) < 0 && errno == EINTR)
+        ;
+
+    return 1;
+}
+
+/* ---------- Main shell loop ---------- */
 
 int main(void)
 {
     char input[INPUT_SIZE];
-    char history[HISTORY_SIZE][INPUT_SIZE];
-    int history_count = 0;
-    char history_path[PATH_SIZE];
 
-    int history_enabled =
-        get_history_path(history_path, sizeof(history_path)) == 0;
+    load_history();
 
-    if (history_enabled) {
-        load_history(history, &history_count, history_path);
-    }
+    printf("Welcome to MyShell! Type 'info' for information.\n");
 
     while (1) {
-        printf("MyShell> ");
+        char directory[PATH_MAX];
+
+        if (getcwd(directory, sizeof(directory)) == NULL)
+            snprintf(directory, sizeof(directory), "?");
+
+        printf("myshell:%s$ ", directory);
         fflush(stdout);
 
         if (fgets(input, sizeof(input), stdin) == NULL) {
+            if (feof(stdin))
+                break;
+
+            if (errno == EINTR) {
+                clearerr(stdin);
+                putchar('\n');
+                continue;
+            }
+
+            perror("myshell: input");
             break;
         }
 
-        size_t input_len = strlen(input);
+        if (strchr(input, '\n') == NULL && !feof(stdin)) {
+            int c;
 
-        if (input_len > 0 &&
-            input[input_len - 1] != '\n' &&
-            !feof(stdin)) {
-            int ch;
+            while ((c = getchar()) != '\n' && c != EOF)
+                ;
 
-            while ((ch = getchar()) != '\n' && ch != EOF) {
-                /* Discard the rest of the oversized input. */
-            }
-
-            fprintf(stderr,
-                    "Input too long (maximum %d characters).\n",
-                    INPUT_SIZE - 1);
+            fprintf(stderr, "myshell: command is too long\n");
             continue;
         }
 
         input[strcspn(input, "\n")] = '\0';
-        trim_whitespace(input);
 
-        if (input[0] == '\0') {
+        char *start = input;
+
+        while (isspace((unsigned char)*start))
+            start++;
+
+        if (*start == '\0')
+            continue;
+
+        /* Save the original command to in-memory and disk history. */
+        add_history(start);
+        save_history_entry(start);
+
+        char expanded[EXPANDED_SIZE];
+
+        if (expand_variables(start, expanded,
+                             sizeof(expanded)) != 0)
+            continue;
+
+        /* Handle a single pipeline first. */
+        if (strchr(expanded, '|') != NULL) {
+            execute_pipeline(expanded);
             continue;
         }
 
-        /* Show history before adding the current history command. */
-        if (strcmp(input, "history") == 0) {
-            show_history(history, history_count);
-            if (history_enabled) {
-                save_history_entry(history_path, input);
-            }
+        char storage[INPUT_SIZE];
+        char *args[MAX_ARGS];
 
-            if (history_count < HISTORY_SIZE) {
-                snprintf(history[history_count], INPUT_SIZE, "%s", input);
-                history_count++;
-            } else {
-                memmove(history[0], history[1],
-                        (HISTORY_SIZE - 1) * INPUT_SIZE);
-                snprintf(history[HISTORY_SIZE - 1], INPUT_SIZE, "%s", input);
-            }
+        int argc = parse_command(expanded, args,
+                                 storage, sizeof(storage));
 
+        if (argc <= 0)
             continue;
-        }
 
-        /* Keep the in-memory history limited to the newest 100 commands. */
-        if (history_count < HISTORY_SIZE) {
-            snprintf(history[history_count], INPUT_SIZE, "%s", input);
-            history_count++;
+        if (is_builtin(args[0])) {
+            if (execute_builtin(args))
+                break;
         } else {
-            memmove(history[0], history[1],
-                    (HISTORY_SIZE - 1) * INPUT_SIZE);
-            snprintf(history[HISTORY_SIZE - 1], INPUT_SIZE, "%s", input);
+            execute_external(args);
         }
-
-        if (history_enabled) {
-            save_history_entry(history_path, input);
-        }
-
-        execute_command(input);
     }
 
+    printf("\nExiting MyShell. Goodbye!\n");
     return 0;
 }
